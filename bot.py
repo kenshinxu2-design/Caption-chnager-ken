@@ -1,178 +1,152 @@
 import os
 import re
 import asyncio
-from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.enums import ParseMode
 
-# --- CONFIGURATION (Railway Variables) ---
-API_ID = int(os.environ.get("API_ID", "0"))
+# Config
+API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMINS = [int(x) for x in os.environ.get("ADMINS", "").split()]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 
-# Default Caption Format
-DEFAULT_CAPTION = """<b><blockquote>💫 {anime_name} 💫</blockquote>
+app = Client("KenshinTurboBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+
+# Global Storage
+video_queue = []
+is_processing = False
+target_sticker = None 
+CUSTOM_CAPTION = """<b><blockquote>💫 {anime_name} 💫</blockquote>
 ‣ Episode : {ep}
 ‣ Season : {season}
 ‣ Quality : {quality}
+‣ Audio : Hindi Dub 🎙️ | Official
 ━━━━━━━━━━━━━━━━━━━━━
 <blockquote>🚀 For More Join
 🔰 [@KENSHIN_ANIME]</blockquote>
 ━━━━━━━━━━━━━━━━━━━━━</b>"""
 
-# Temporary Storage
-video_queue = {}
-user_captions = {}
+def get_quality_rank(q_str):
+    ranks = {"480p": 1, "720p": 2, "1080p": 3, "4k": 4, "2160p": 5}
+    return ranks.get(q_str.lower(), 0)
 
-app = Client("KenshinAutoBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# --- Commands ---
 
-# --- CORE LOGIC: INFO EXTRACTION ---
-def extract_info(text, filename=""):
-    content = f"{text} {filename}".replace("_", " ").replace(".", " ")
-    
-    # Regex for Anime Name, Episode, Season, Quality
-    anime_match = re.search(r'(?i)(?:ᴀɴɪᴍᴇ|Anime)[\s\:\-]*([^\n\r━|\[]+)', content)
-    ep_match = re.search(r'(?i)(?:Episode|Ep|S\d+E|E|EPISODE\s*-)[\s\:\-]*(\d+)', content)
-    season_match = re.search(r'(?i)(?:Season|S|S0)[\s\:\-]*(\d+)', content)
-    quality_match = re.search(r'(\d{3,4}p|4k|2160p)', content)
+@app.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message: Message):
+    await message.reply("<blockquote>Jinda hu abhi....</blockquote>")
 
-    anime_name = anime_match.group(1).strip() if anime_match else "Unknown Anime"
-    ep = ep_match.group(1).zfill(2) if ep_match else "01"
+@app.on_message(filters.command("set_sticker") & filters.reply & filters.user(ADMIN_ID))
+async def set_sticker_cmd(client, message: Message):
+    global target_sticker
+    if message.reply_to_message.sticker:
+        target_sticker = message.reply_to_message.sticker.file_id
+        await message.reply("✅ <b>Sticker Set!</b>")
+
+@app.on_message(filters.command("set_caption") & filters.user(ADMIN_ID))
+async def set_caption_cmd(client, message: Message):
+    global CUSTOM_CAPTION
+    if len(message.command) > 1:
+        CUSTOM_CAPTION = message.text.split(None, 1)[1]
+        await message.reply(f"✅ <b>Custom Caption Set!</b>\n\nPreview:\n{CUSTOM_CAPTION}")
+    else:
+        await message.reply("❌ <b>Format:</b> <code>/set_caption [aapka text]</code>\nPlaceholders: <code>{anime_name}, {ep}, {season}, {quality}</code>")
+
+@app.on_message(filters.command("cancel_queue") & filters.user(ADMIN_ID))
+async def cancel_queue_cmd(client, message: Message):
+    global video_queue, is_processing
+    video_queue = []
+    is_processing = False
+    await message.reply("🛑 <b>Queue Cancelled!</b>")
+
+# --- Universal Extraction Logic ---
+
+def extract_data(caption):
+    # Season Detection (S01, Season 01, ( S01 ))
+    season_match = re.search(r"(?i)(?:Season|S)[\s\-:]*(\d+)", caption)
     season = season_match.group(1).zfill(2) if season_match else "01"
-    quality = quality_match.group(1).upper() if quality_match else "Unknown"
 
-    return {"anime_name": anime_name, "ep": ep, "season": season, "quality": quality}
+    # Episode Detection (Episode - 31, Ep 31, Ep:31)
+    ep_match = re.search(r"(?i)(?:Episode|Ep)[\s\-:]*(\d+)", caption)
+    ep_num = int(ep_match.group(1)) if ep_match else 0
+    ep_str = str(ep_num).zfill(2)
 
-def sort_key(item):
-    # Sorting purely based on Episode number
-    try:
-        return int(item['info']['ep'])
-    except:
-        return 0
+    # Quality Detection
+    quality_match = re.search(r"(?i)(1080p|720p|480p|360p|4K|2160p)", caption)
+    quality = quality_match.group(1) if quality_match else "HD"
 
-# --- COMMANDS ---
-@app.on_message(filters.command("start") & filters.user(ADMINS))
-async def start(c, m):
-    await m.reply_text(
-        f"👋 **Hi {m.from_user.mention}!**\n\n"
-        "Main ek advanced Video Processor bot hu jo queueing aur sorting support karta hai.\n\n"
-        "🚀 **Kaise use karein?**\n"
-        "1. Saari videos ek saath bhej do.\n"
-        "2. Ek **Photo** bhejo (wo thumbnail ban jayegi).\n"
-        "3. Bot automatic sort karke process shuru kar dega.\n\n"
-        "💡 Baaki commands ke liye `/help` dekhein.",
-        parse_mode=enums.ParseMode.HTML
-    )
+    # Anime Name Detection
+    # Pehle check karega "Name:" ya "Anime:" ke aage, phir first line
+    name_match = re.search(r"(?i)(?:ᴀɴɪᴍᴇ|Anime|Name|📟)[\s\-:]*([^\n|(\-]+)", caption)
+    if name_match:
+        anime_name = name_match.group(1).strip()
+    else:
+        anime_name = caption.split('\n')[0].strip()[:30] # Backup: First line
 
-@app.on_message(filters.command("help") & filters.user(ADMINS))
-async def help_cmd(c, m):
-    help_text = """
-🔧 **Bot Commands & Usage:**
+    return anime_name, ep_str, ep_num, season, quality
 
-1️⃣ **Video Queuing:** Kisi bhi video ko forward ya upload karo, bot usey memory mein save kar lega.
-2️⃣ **Set Caption:** Naya format set karne ke liye:
-   `/set_caption {anime_name} | Ep {ep} | {quality}`
-   *(Placeholders: {anime_name}, {ep}, {season}, {quality})*
-3️⃣ **Processing:** Jaise hi aap ek **Photo** bhejenge, process start ho jayega.
-4️⃣ **Clear Queue:** `/clear` command se pending videos delete karein.
+# --- Turbo Processing ---
 
-⚠️ **Note:** Thumbnail change karne ke liye Photo bhejna zaroori hai.
-    """
-    await m.reply_text(help_text)
-
-@app.on_message(filters.command("set_caption") & filters.user(ADMINS))
-async def set_cap(c, m):
-    if len(m.command) < 2:
-        return await m.reply("❌ **Format missing!**\nExample: `/set_caption My Anime - {ep} [{quality}]`")
+async def process_queue(client, chat_id):
+    global is_processing, video_queue, target_sticker, CUSTOM_CAPTION
+    is_processing = True
+    video_queue.sort(key=lambda x: (x['ep_num'], x['q_rank']))
     
-    new_cap = m.text.split(" ", 1)[1]
-    user_captions[m.from_user.id] = new_cap
-    await m.reply(f"✅ **Custom Caption Saved!**\n\n`{new_cap}`")
+    status_msg = await client.send_message(chat_id, "🚀 <b>Turbo Mode Active...</b>")
 
-@app.on_message(filters.command("clear") & filters.user(ADMINS))
-async def clear_queue(c, m):
-    video_queue[m.from_user.id] = []
-    await m.reply("🗑 **Queue cleared successfully!**")
+    last_ep = None
+    for item in video_queue:
+        if not is_processing: break
+        msg = item['message']
+        
+        if last_ep is not None and item['ep_num'] != last_ep:
+            if target_sticker:
+                await client.send_sticker(chat_id, target_sticker)
+            last_ep = item['ep_num']
 
-# --- VIDEO HANDLER ---
-@app.on_message((filters.video | filters.document) & filters.user(ADMINS))
-async def collect_videos(c, m):
-    user_id = m.from_user.id
-    if user_id not in video_queue:
-        video_queue[user_id] = []
-    
-    media = m.video or m.document
-    # Only allow videos or video-documents
-    if m.document and not m.document.mime_type.startswith("video/"):
-        return
-
-    info = extract_info(m.caption or "", media.file_name or "")
-    
-    video_queue[user_id].append({
-        "file_id": media.file_id,
-        "info": info,
-        "file_name": media.file_name or "video.mp4"
-    })
-    
-    tmp = await m.reply_text(f"📥 **Added:** `{info['ep']}` | Queue: **{len(video_queue[user_id])}**", quote=True)
-    await asyncio.sleep(3)
-    await tmp.delete()
-
-# --- PHOTO HANDLER (THE TRIGGER) ---
-@app.on_message(filters.photo & filters.user(ADMINS))
-async def process_trigger(c, m):
-    user_id = m.from_user.id
-    if user_id not in video_queue or not video_queue[user_id]:
-        return await m.reply("❌ **Queue khaali hai!** Pehle kuch videos bhejo.")
-
-    status = await m.reply("⏳ **Processing...**\nSorting episodes and downloading thumbnail.")
-    
-    # Download photo to use as thumb
-    thumb_path = await m.download()
-    
-    # Sort the queue by Episode Number
-    video_queue[user_id].sort(key=sort_key)
-    
-    cap_format = user_captions.get(user_id, DEFAULT_CAPTION)
-    count = 0
-    total = len(video_queue[user_id])
-
-    for item in video_queue[user_id]:
         try:
-            count += 1
-            info = item["info"]
-            new_caption = cap_format.format(
-                anime_name=info["anime_name"],
-                ep=info["ep"],
-                season=info["season"],
-                quality=info["quality"]
+            f_id = msg.video.file_id if msg.video else msg.document.file_id
+            await client.send_video(
+                chat_id=chat_id,
+                video=f_id,
+                caption=CUSTOM_CAPTION.format(
+                    anime_name=item['name'], ep=item['ep_str'], 
+                    season=item['season'], quality=item['quality']
+                ),
+                parse_mode=ParseMode.HTML,
+                supports_streaming=True
             )
-            
-            await status.edit(f"🚀 **Sending Video {count} of {total}**\nEP: `{info['ep']}`")
-            
-            await c.send_video(
-                chat_id=m.chat.id,
-                video=item["file_id"],
-                caption=new_caption,
-                thumb=thumb_path, # Fixed: Using local path
-                parse_mode=enums.ParseMode.HTML
-            )
-            
-            # Anti-flood delay
-            await asyncio.sleep(2)
-            
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
+            await msg.delete()
+            await asyncio.sleep(0.6) # Faster Delay
         except Exception as e:
-            await m.reply(f"❌ Error in EP {item['info']['ep']}: `{e}`")
+            print(f"Error: {e}")
 
-    # Cleanup
-    if os.path.exists(thumb_path):
-        os.remove(thumb_path)
-    video_queue[user_id] = []
-    
-    await status.edit(f"✅ **All Done!**\nTotal **{total}** videos processed and sent in sorted order.")
+    if is_processing and target_sticker:
+        await client.send_sticker(chat_id, target_sticker)
 
-# --- RUN BOT ---
-print("Bot is alive...")
+    await status_msg.edit("✅ <b>Kaam Ho Gaya!</b>")
+    video_queue = []
+    is_processing = False
+
+@app.on_message((filters.video | filters.document) & filters.private & filters.user(ADMIN_ID))
+async def collector(client, message: Message):
+    global video_queue
+    name, ep_str, ep_num, season, quality = extract_data(message.caption or "")
+
+    video_queue.append({
+        'message': message,
+        'name': name,
+        'ep_str': ep_str,
+        'ep_num': ep_num,
+        'season': season,
+        'quality': quality,
+        'q_rank': get_quality_rank(quality)
+    })
+
+    if not is_processing:
+        await asyncio.sleep(3)
+        if not is_processing and video_queue:
+            await process_queue(client, message.chat.id)
+
 app.run()
